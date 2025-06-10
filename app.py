@@ -12,56 +12,28 @@ from constructs import Construct
 import sqlite3
 from sqlite3 import OperationalError
 
-# sql-injection vulnerability example for codeguru demo
-def execute_query_noncompliant(request):
+def execute_query_compliant(request):
     import sqlite3
     name = request.GET.get("name")
-    query = "SELECT * FROM Users WHERE name = " + name + ";"
+    if not name:
+        return None
+    query = "SELECT * FROM Users WHERE name = ?;"
     with sqlite3.connect("example.db") as connection:
         cursor = connection.cursor()
-        # Noncompliant: user input is used without sanitization.
-        cursor.execute(query)
-        connection.commit()
-        connection.close()
+        cursor.execute(query, (name,))
+        return cursor.fetchall()
 
 class CdklambdaStack(Stack):
 
     def __init__(self, scope: Construct, id: str, **kwargs):
         super().__init__(scope, id, **kwargs)
 
-               
-        # Valid Bucket
         self.valid_bucket = s3.Bucket(self, 'valid-bucket',
                                       versioned=True,
                                       bucket_name='processed-docs-bucket-shaoyi',
                                       encryption=s3.BucketEncryption.S3_MANAGED,
                                       block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
                                       enforce_ssl=True)
-        
-
-        python_lambda_kwargs = {
-            'handler': 'imggen.lambda_handler',
-            'runtime': lambda_.Runtime.PYTHON_3_9,
-            'timeout': Duration.minutes(10),
-            'memory_size': 8192
-        }
-
-        python_lambda_kwargs_textgen = {
-            'handler': 'textgen.lambda_handler',
-            'runtime': lambda_.Runtime.PYTHON_3_9,
-            'timeout': Duration.minutes(10),
-            'memory_size': 8192
-        }
-
-        # Create Lambda functions
-        trigger_imggen = lambda_.Function(self, 'file-upload-trigger', **python_lambda_kwargs,
-                                          code=lambda_.Code.from_asset('lambda1'),
-                                          function_name="start-imggen")
-
-        trigger_textgen = lambda_.Function(self, 'textgen-trigger', **python_lambda_kwargs_textgen,
-                                            code=lambda_.Code.from_asset('lambda2'),
-                                            function_name="start-textgen")       
-        
 
         lambda_layer = lambda_.LayerVersion(
             self, "LambdaLayer",
@@ -69,60 +41,78 @@ class CdklambdaStack(Stack):
             compatible_runtimes=[lambda_.Runtime.PYTHON_3_9]
         )
 
-        trigger_imggen.add_to_role_policy(iam.PolicyStatement(
-            actions=["lambda:GetLayerVersion"],
-            resources=[lambda_layer.layer_version_arn]
-        ))
+        common_lambda_config = {
+            'runtime': lambda_.Runtime.PYTHON_3_9,
+            'timeout': Duration.minutes(10),
+            'memory_size': 8192,
+            'layers': [lambda_layer]
+        }
 
-        trigger_textgen.add_to_role_policy(iam.PolicyStatement(
-            actions=["lambda:GetLayerVersion"],
-            resources=[lambda_layer.layer_version_arn]
-        ))
+        trigger_imggen = lambda_.Function(self, 'file-upload-trigger',
+                                          handler='imggen.lambda_handler',
+                                          code=lambda_.Code.from_asset('lambda1'),
+                                          function_name="start-imggen",
+                                          **common_lambda_config)
 
-        trigger_imggen.add_layers(lambda_layer)
-        trigger_textgen.add_layers(lambda_layer)
+        trigger_textgen = lambda_.Function(self, 'textgen-trigger',
+                                            handler='textgen.lambda_handler',
+                                            code=lambda_.Code.from_asset('lambda2'),
+                                            function_name="start-textgen",
+                                            **common_lambda_config)
 
-        # Create Lambda Rest APIs
-        textapi = apigateway.RestApi(
-            self, 'TextApi',
-            description='example api gateway',
-            deploy_options={
-                "stage_name": 'dev'
-            },
-            default_cors_preflight_options=apigateway.CorsOptions(
-                allow_origins=apigateway.Cors.ALL_ORIGINS,
-                allow_headers=[
-                    'Content-Type',
-                    'X-Amz-Date',
-                    'Authorization',
-                    'X-Api-Key',
-                ],
-                allow_methods=['OPTIONS', 'POST']
-            )
+        common_cors_options = apigateway.CorsOptions(
+            allow_origins=apigateway.Cors.ALL_ORIGINS,
+            allow_headers=[
+                'Content-Type',
+                'X-Amz-Date',
+                'Authorization',
+                'X-Api-Key',
+            ],
+            allow_methods=['OPTIONS', 'POST']
         )
 
-        # Create Lambda Rest APIs
-        imgapi = apigateway.RestApi(
-            self, 'ImgApi',
-            description='example api gateway',
-            deploy_options={
-                "stage_name": 'dev'
-            },
-            default_cors_preflight_options=apigateway.CorsOptions(
-                allow_origins=apigateway.Cors.ALL_ORIGINS,
-                allow_headers=[
-                    'Content-Type',
-                    'X-Amz-Date',
-                    'Authorization',
-                    'X-Api-Key',
-                ],
-                allow_methods=['OPTIONS', 'POST']
-            )
+        textapi = self._create_api('TextApi', common_cors_options)
+        imgapi = self._create_api('ImgApi', common_cors_options)
+
+        self._add_lambda_integration(textapi, trigger_textgen)
+        self._add_lambda_integration(imgapi, trigger_imggen)
+
+        common_policy_statement = iam.PolicyStatement(
+            actions=[
+                's3:GetObject',
+                's3:PutObject',
+                's3:ListBucket',
+                's3:DeleteObject',
+                'bedrock:ListFoundationModels',
+                'bedrock:GetFoundationModel',
+                'bedrock:InvokeModel',
+                'bedrock:InvokeModelWithResponseStream',
+                'bedrock:RetrieveAndGenerate'
+            ],
+            resources=[
+                self.valid_bucket.bucket_arn,
+                f"{self.valid_bucket.bucket_arn}/*",
+                "arn:aws:bedrock:*:*:foundation-model/*"
+            ]
         )
 
-        # Lambda Integration for textapi
-        integration_textgen = apigateway.LambdaIntegration(
-            trigger_textgen, 
+        for trigger in [trigger_imggen, trigger_textgen]:
+            trigger.add_to_role_policy(common_policy_statement)
+
+        CfnOutput(self, 'TextApiInvokeUrl', value=textapi.url)
+        CfnOutput(self, 'ImgApiInvokeUrl', value=imgapi.url)
+
+    def _create_api(self, api_id: str, cors_options: apigateway.CorsOptions) -> apigateway.RestApi:
+        return apigateway.RestApi(
+            self, api_id,
+            description='example api gateway',
+            deploy_options={"stage_name": 'dev'},
+            default_cors_preflight_options=cors_options
+        )
+
+    def _add_lambda_integration(self, api: apigateway.RestApi, lambda_function: lambda_.Function):
+        integration = apigateway.LambdaIntegration(
+            lambda_function, 
             proxy=False,
             integration_responses=[
                 apigateway.IntegrationResponse(
@@ -133,12 +123,10 @@ class CdklambdaStack(Stack):
                 )
             ]
         )
-        
 
-        # Add POST method with response headers and models
-        textapi.root.add_method(
+        api.root.add_method(
             "POST",
-            integration_textgen,
+            integration,
             method_responses=[
                 apigateway.MethodResponse(
                     status_code="200",
@@ -151,58 +139,6 @@ class CdklambdaStack(Stack):
                 )
             ]
         )
-
-        # Lambda Integration for imgapi
-        integration_imggen = apigateway.LambdaIntegration(
-            trigger_imggen, 
-            proxy=False,
-            integration_responses=[
-                apigateway.IntegrationResponse(
-                    status_code="200",
-                    response_parameters={
-                        'method.response.header.Access-Control-Allow-Origin': "'*'"
-                    }
-                )
-            ]
-        )       
-
-        # Add POST method with response headers and models
-        imgapi.root.add_method(
-            "POST",
-            integration_imggen,
-            method_responses=[
-                apigateway.MethodResponse(
-                    status_code="200",
-                    response_parameters={
-                        'method.response.header.Access-Control-Allow-Origin': True,
-                    },
-                    response_models={
-                        'application/json': apigateway.Model.EMPTY_MODEL,
-                    }
-                )
-            ]
-        )
-
-        # Grant full access to S3 and Textract for both Lambda functions
-        for trigger, api in [(trigger_imggen, imgapi), (trigger_textgen, textapi)]:
-            trigger.add_to_role_policy(iam.PolicyStatement(
-                actions=[
-                    's3:GetObject',
-                    's3:PutObject',
-                    's3:ListBucket',
-                    's3:DeleteObject',
-                    'bedrock:ListFoundationModels',
-                    'bedrock:GetFoundationModel',
-                    'bedrock:InvokeModel',
-                    'bedrock:InvokeModelWithResponseStream',
-                    'bedrock:RetrieveAndGenerate'
-                ],
-                resources=['*']
-            ))
-
-        # Print the invoke URL in the output for both APIs
-        for api, name in [(textapi, 'TextApiInvokeUrl'), (imgapi, 'ImgApiInvokeUrl')]:
-            CfnOutput(self, name, value=api.url)        
 
 app = App()
 CdklambdaStack(app, "CdkbedrockStack")
