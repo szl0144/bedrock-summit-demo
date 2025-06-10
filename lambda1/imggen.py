@@ -15,26 +15,12 @@ LOG.setLevel(logging.INFO)
 region_name = os.getenv("region", "us-east-1")
 s3_bucket = "processed-docs-bucket"
 model_id = os.getenv("model_id", "stability.stable-diffusion-xl-v0")
-style_preset = os.getenv("style_preset", "photographic")  # digital-art, cinematic
+style_preset = os.getenv("style_preset", "photographic")
 
-# Bedrock client used to interact with APIs around models
-bedrock = boto3.client(service_name="bedrock", region_name=region_name)
-
-# Bedrock Runtime client used to invoke and question the models
 bedrock_runtime = boto3.client(service_name="bedrock-runtime", region_name=region_name)
-
-# S3 client used to interact with S3 buckets
 s3_client = boto3.client('s3')
 
 def generate_signed_url(s3_bucket, s3_key, expiration=3600):
-    s3_client = boto3.client('s3')
-    url = s3_client.generate_presigned_url('get_object',
-                                          Params={'Bucket': s3_bucket, 'Key': s3_key},
-                                          ExpiresIn=expiration)
-    return url
-
-def generate_signed_url(s3_bucket, s3_key, expiration=3600):
-    s3_client = boto3.client('s3')
     url = s3_client.generate_presigned_url('get_object',
                                           Params={'Bucket': s3_bucket, 'Key': s3_key},
                                           ExpiresIn=expiration)
@@ -64,7 +50,6 @@ def lambda_handler(event, context):
         })
 
         response = bedrock_runtime.invoke_model(body=request, modelId=model_id)
-        # LOG.info(response)
 
         response_body = json.loads(response.get("body").read())
         LOG.info(f"Response body: {response_body}")
@@ -72,23 +57,12 @@ def lambda_handler(event, context):
         base_64_img_str = response_body["artifacts"][0].get("base64")
         LOG.info(f"Base string is {base_64_img_str}")
 
-        # Convert the base64 encoded data to an image
-        generated_img = Image.open(io.BytesIO(base64.decodebytes(bytes(base_64_img_str, "utf-8"))))
-        temp_path = "/tmp/generatedFilePath"
-        temp_file_name = 'generatedImage' + '_' + str(random.randint(1, 100000000000000000)) + '.png'
-        temp_file_path = temp_path + "/" + temp_file_name
+        image_data = base64.b64decode(base_64_img_str)
+        s3_key = f"generatedImage_{random.randint(1, 100000000000000000)}.png"
+        
+        s3_client.put_object(Bucket=s3_bucket, Key=s3_key, Body=image_data, ContentType='image/png')
 
-        # Save the file temporarily in Lambda memory
-        os.makedirs(temp_path, exist_ok=True)
-        generated_img.save(temp_file_path)
-
-        # Upload the generated image to S3 bucket
-        s3_key = f"{temp_file_name}"
-        s3_client.upload_file(temp_file_path, s3_bucket, s3_key)
-
-        # Generate a signed URL for the S3 object
-        expiration_time = 3600  # seconds
-        print(expiration_time)  # Add this line to print the expiration time
+        expiration_time = 3600
         signed_url = generate_signed_url(s3_bucket, s3_key, expiration=expiration_time)
 
         return {
@@ -101,5 +75,5 @@ def lambda_handler(event, context):
 
         return {
             "statusCode": http.HTTPStatus.INTERNAL_SERVER_ERROR,
-            "body": json.dumps({"error": "Internal Server Error", "details": e})
+            "body": json.dumps({"error": "Internal Server Error", "details": str(e)})
         }
