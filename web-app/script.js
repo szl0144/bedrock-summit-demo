@@ -2,17 +2,24 @@ const messageContainer = document.getElementById('messageContainer');
 const userInput = document.getElementById('userInput');
 const sendButton = document.getElementById('sendButton');
 
+let isProcessing = false;
+
 sendButton.addEventListener('click', sendMessage);
-userInput.addEventListener('keyup', function(event) {
-    if (event.keyCode === 13) {
+userInput.addEventListener('keydown', function(event) {
+    if (event.key === 'Enter') {
         event.preventDefault();
         sendMessage();
     }
 });
 
 async function sendMessage() {
+    if (isProcessing) return;
+    
     const userMessage = userInput.value.trim();
     if (userMessage) {
+        isProcessing = true;
+        sendButton.disabled = true;
+        
         appendMessage('user', userMessage);
         userInput.value = '';
 
@@ -36,6 +43,9 @@ async function sendMessage() {
             }
         } catch (error) {
             botMessageElement.textContent = 'An error occurred: ' + error.message;
+        } finally {
+            isProcessing = false;
+            sendButton.disabled = false;
         }
     }
 }
